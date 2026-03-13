@@ -1,0 +1,17 @@
+pyspark
+oci
+torch 
+torchvision 
+torchaudio 
+transformers 
+accelerate 
+pillow 
+qwen-vl-utils 
+bitsandbytes
+python-dotenv
+jupyter
+ipykernel
+oracledb
+streamlit
+sqlachemy
+opencv-python
