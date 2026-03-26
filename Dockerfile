@@ -19,6 +19,6 @@ done && \
 echo 'Listener is ready.' && \
 sleep 40 && \
 echo 'Running SQL pipeline...' && \
-sqlplus -s 'sys/Osc-indonesia123!@FREEPDB1 as sysdba' @/opt/oracle/project/init.sql && \
+sqlplus -s \"sys/${ORACLE_PWD}@FREEPDB1 as sysdba\" @/opt/oracle/project/init.sql && \
 echo 'Pipeline finished.' && \
 wait"

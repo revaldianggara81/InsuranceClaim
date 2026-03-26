@@ -1,0 +1,10 @@
+streamlit
+oci
+python-dotenv
+openai
+oracledb
+sqlalchemy
+opencv-python-headless
+pillow
+pandas
+pypdf

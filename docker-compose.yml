@@ -1,0 +1,83 @@
+version: "3.8"
+
+# ============================================================
+# InsuranceClaim — Docker Compose
+# Services: oracle-db | ollama | streamlit
+# ============================================================
+
+networks:
+  claims-net:
+    driver: bridge
+
+services:
+
+  # ── 1. Oracle Database (Bronze / Silver / Gold) ────────────
+  oracle-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claims_db-medallion
+    ports:
+      - "1521:1521"
+      - "5500:5500"
+    env_file:
+      - .env
+    networks:
+      - claims-net
+    healthcheck:
+      test: ["CMD-SHELL", "lsnrctl status > /dev/null 2>&1 && echo OK"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 180s
+
+  # ── 2. Ollama (LLM + VLM) ─────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: claims_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Mount model dari host langsung — tidak perlu download ulang
+      - /usr/share/ollama/.ollama:/root/.ollama
+      - ./scripts:/scripts
+    # GPU support — hapus blok 'deploy' jika tidak ada GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - claims-net
+    # Jalankan Ollama server + pull model secara otomatis
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        sleep 5 &&
+        /scripts/ollama_init.sh &&
+        wait
+      "
+
+  # ── 3. Streamlit App ───────────────────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: claims_streamlit
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Override host agar pakai nama service Docker
+      ORACLE_BRONZE_HOST: oracle-db
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - claims-net
