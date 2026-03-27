@@ -232,6 +232,50 @@ def _run_vlm_and_silver(
     return vlm_results
 
 
+# ── Direct Gold REJECT write (used by safety gate + no-evidence cases) ────────
+
+def _upsert_gold_reject(engine_gold, claim_id: str, fusion_text: str,
+                        reasons: str, evidence_list: list):
+    """Write a REJECT record directly to Gold without going through silver_to_gold."""
+    merge_sql = text("""
+        MERGE INTO claim_decision t
+        USING (SELECT :claim_id AS claim_id FROM dual) s
+        ON (t."claim_id" = s.claim_id)
+        WHEN MATCHED THEN UPDATE SET
+            t."decision"           = 'REJECT',
+            t."fusion_text"        = :fusion_text,
+            t."action"             = 'NOTIFY',
+            t."reasons_json"       = :reasons_json,
+            t."evidence_refs_json" = :evidence_refs_json,
+            t."confidence"         = 0,
+            t."est_payout_usd"     = 0,
+            t.decision_tag         = 'REJECT_SYSTEM',
+            t."updated_at"         = :ts,
+            t."updated_by"         = 'pipeline'
+        WHEN NOT MATCHED THEN INSERT (
+            "claim_id", "decision", "fusion_text", "action",
+            "reasons_json", "evidence_refs_json", "confidence", "est_payout_usd",
+            decision_tag, "created_at", "created_by", "updated_at", "updated_by"
+        ) VALUES (
+            :claim_id, 'REJECT', :fusion_text, 'NOTIFY',
+            :reasons_json, :evidence_refs_json, 0, 0,
+            'REJECT_SYSTEM', :ts, 'pipeline', :ts, 'pipeline'
+        )
+    """)
+    try:
+        with engine_gold.begin() as conn:
+            conn.execute(merge_sql, {
+                "claim_id":           claim_id,
+                "fusion_text":        fusion_text[:4000],
+                "reasons_json":       reasons[:4000],
+                "evidence_refs_json": json.dumps(evidence_list)[:4000],
+                "ts":                 datetime.utcnow(),
+            })
+        log.info(f"[Gold] REJECT written for {claim_id} (safety gate)")
+    except Exception as e:
+        log.error(f"[Gold] Failed to write safety-gate REJECT for {claim_id}: {e}")
+
+
 # ── Step 3: Silver → Gold ─────────────────────────────────────────────────────
 
 def _run_silver_to_gold(claim_id: str):
@@ -277,6 +321,7 @@ def _query_gold_decision(engine_gold, claim_id: str) -> Optional[dict]:
             "reasons_json":   raw_reasons,
             "evidence_list":  evidence_list,
             "pdf_url":        pdf_url,
+            "decision_tag":   str(row.get("decision_tag") or ""),
         }
     except Exception as e:
         log.error(f"Gold query error: {e}")
@@ -306,25 +351,28 @@ def run_full_pipeline(
         claim_id, decision, action, est_payout_myr, fusion_text,
         confidence, reasons_json, evidence_list, pdf_url
     """
-    # ── Input Validation ──────────────────────────────────────────────────────
-    has_any_evidence = bool(video_bytes or img1_bytes or img2_bytes)
-    if not has_any_evidence:
-        return {
-            "claim_id":       claim_id,
-            "decision":       "REJECT",
-            "action":         "NOTIFY",
-            "est_payout_myr": 0.0,
-            "fusion_text":    "Submission rejected: no evidence files were uploaded. Please attach at least one image or video.",
-            "confidence":     0.0,
-            "reasons_json":   "No evidence provided.",
-            "evidence_list":  [],
-            "pdf_url":        "",
-        }
-
     try:
         engine_bronze = _make_engine("ORACLE_BRONZE_USER", "ORACLE_BRONZE_PASSWORD", "claims_bronze", "claims_bronze")
         engine_silver = _make_engine("ORACLE_SILVER_USER", "ORACLE_SILVER_PASSWORD", "claims_silver", "claims_silver")
         engine_gold   = _make_engine("ORACLE_GOLD_USER",   "ORACLE_GOLD_PASSWORD",   "claims_gold",   "claims_gold")
+
+        # ── Input Validation ──────────────────────────────────────────────────
+        has_any_evidence = bool(video_bytes or img1_bytes or img2_bytes)
+        if not has_any_evidence:
+            reason = "Submission rejected: no evidence files were uploaded. Please attach at least one image or video."
+            _ensure_policy(engine_gold, policy_id, holder_name)
+            _upsert_gold_reject(engine_gold, claim_id, reason, "No evidence provided.", [])
+            return {
+                "claim_id":       claim_id,
+                "decision":       "REJECT",
+                "action":         "NOTIFY",
+                "est_payout_myr": 0.0,
+                "fusion_text":    reason,
+                "confidence":     0.0,
+                "reasons_json":   "No evidence provided.",
+                "evidence_list":  [],
+                "pdf_url":        "",
+            }
 
         evidence_prefix = os.getenv("OCI_EVIDENCE_PREFIX", evidence_prefix)
 
@@ -356,7 +404,10 @@ def run_full_pipeline(
                 f"Insurance claims require valid accident evidence. If you believe this is an error, "
                 f"please resubmit with correct evidence."
             )
+            reasons_text   = "Evidence validation failed: submitted files are not vehicle accident evidence."
+            evidence_uris  = [u for u in [video_uri, img1_uri, img2_uri] if u]
             log.warning(f"[Safety Gate] {claim_id}: NOT_ACCIDENT detected in {labels} → REJECT")
+            _upsert_gold_reject(engine_gold, claim_id, reason, reasons_text, evidence_uris)
             return {
                 "claim_id":       claim_id,
                 "decision":       "REJECT",
@@ -364,8 +415,8 @@ def run_full_pipeline(
                 "est_payout_myr": 0.0,
                 "fusion_text":    reason,
                 "confidence":     0.0,
-                "reasons_json":   "Evidence validation failed: submitted files are not vehicle accident evidence.",
-                "evidence_list":  [u for u in [video_uri, img1_uri, img2_uri] if u],
+                "reasons_json":   reasons_text,
+                "evidence_list":  evidence_uris,
                 "pdf_url":        "",
             }
 

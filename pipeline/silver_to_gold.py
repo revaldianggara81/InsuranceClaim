@@ -31,6 +31,26 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 USD_TO_MYR = Decimal("4.70")
 
 
+# ── Schema Migration ──────────────────────────────────────────────────────────
+
+def _ensure_schema(engine_gold):
+    """Add decision_tag column if it doesn't exist (safe for existing DBs)."""
+    try:
+        with engine_gold.begin() as conn:
+            conn.execute(text("ALTER TABLE claim_decision ADD (decision_tag VARCHAR2(50))"))
+        print("[Gold] Added column: decision_tag")
+    except Exception:
+        pass  # ORA-01430: column already exists — that's fine
+
+
+def _decision_tag(decision: str) -> str:
+    if "APPROVE" in decision:
+        return "APPROVE_SYSTEM"
+    if decision == "REJECT":
+        return "REJECT_SYSTEM"
+    return "PENDING_REVIEW"
+
+
 # ── DB Engines ────────────────────────────────────────────────────────────────
 
 def make_engine(user_env: str, pw_env: str, default_user: str, default_pw: str):
@@ -243,7 +263,8 @@ def load_data(engine_bronze, engine_silver, engine_gold, claim_id_filter=None):
 
     with engine_gold.connect() as conn:
         df_policy = pd.read_sql("SELECT * FROM policies", conn)
-        df_claims = pd.read_sql("SELECT claim_id FROM claims", conn)
+        # Check existing decisions (not the empty `claims` reference table)
+        df_claims = pd.read_sql('SELECT "claim_id" AS claim_id FROM claim_decision', conn)
         df_driver = pd.read_sql("SELECT * FROM drivers", conn)
 
     with engine_bronze.connect() as conn:
@@ -311,6 +332,8 @@ def process_claim(claim_id, rows, kb_content: str = "", pdf_url: str = "") -> tu
         claim_id, decision, action, payout_myr, rows, kb_content, pdf_url
     )
 
+    tag = _decision_tag(decision)
+
     return (
         claim_id,
         decision,
@@ -320,6 +343,7 @@ def process_claim(claim_id, rows, kb_content: str = "", pdf_url: str = "") -> tu
         json.dumps(uris),
         _safe_decimal(max(confidences)),
         payout_myr,
+        tag,
         datetime.utcnow(), "system",
         datetime.utcnow(), "system",
     )
@@ -340,16 +364,17 @@ def upsert_gold(engine_gold, df_out):
             t."evidence_refs_json" = :evidence_refs_json,
             t."confidence"         = :confidence,
             t."est_payout_usd"     = :est_payout_usd,
+            t.decision_tag         = :decision_tag,
             t."updated_at"         = :updated_at,
             t."updated_by"         = :updated_by
         WHEN NOT MATCHED THEN INSERT (
             "claim_id", "decision", "fusion_text", "action",
             "reasons_json", "evidence_refs_json", "confidence", "est_payout_usd",
-            "created_at", "created_by", "updated_at", "updated_by"
+            decision_tag, "created_at", "created_by", "updated_at", "updated_by"
         ) VALUES (
             :claim_id, :decision, :fusion_text, :action,
             :reasons_json, :evidence_refs_json, :confidence, :est_payout_usd,
-            :created_at, :created_by, :updated_at, :updated_by
+            :decision_tag, :created_at, :created_by, :updated_at, :updated_by
         )
     """)
     with engine_gold.connect() as conn:
@@ -361,8 +386,9 @@ def upsert_gold(engine_gold, df_out):
                 "action":             row["action"],
                 "reasons_json":       row["reasons_json"],
                 "evidence_refs_json": row["evidence_refs_json"],
-                "confidence":         float(row["confidence"])    if row["confidence"]    is not None else None,
-                "est_payout_usd":     float(row["est_payout_usd"]) if row["est_payout_usd"] is not None else None,
+                "confidence":         float(row["confidence"])      if row["confidence"]      is not None else None,
+                "est_payout_usd":     float(row["est_payout_usd"])  if row["est_payout_usd"]  is not None else None,
+                "decision_tag":       row["decision_tag"],
                 "created_at":         row["created_at"],
                 "created_by":         row["created_by"],
                 "updated_at":         row["updated_at"],
@@ -378,6 +404,8 @@ def run(claim_id_filter=None):
     engine_bronze = make_engine("ORACLE_BRONZE_USER", "ORACLE_BRONZE_PASSWORD", "claims_bronze", "claims_bronze")
     engine_silver = make_engine("ORACLE_SILVER_USER", "ORACLE_SILVER_PASSWORD", "claims_silver", "claims_silver")
     engine_gold   = make_engine("ORACLE_GOLD_USER",   "ORACLE_GOLD_PASSWORD",   "claims_gold",   "claims_gold")
+
+    _ensure_schema(engine_gold)
 
     kb_content, pdf_url = "", ""
     try:
@@ -404,10 +432,10 @@ def run(claim_id_filter=None):
     df_out = pd.DataFrame(records, columns=[
         "claim_id", "decision", "fusion_text", "action", "reasons_json",
         "evidence_refs_json", "confidence", "est_payout_usd",
-        "created_at", "created_by", "updated_at", "updated_by",
+        "decision_tag", "created_at", "created_by", "updated_at", "updated_by",
     ])
 
-    print(df_out[["claim_id", "decision", "action", "confidence", "est_payout_usd"]].to_string())
+    print(df_out[["claim_id", "decision", "action", "confidence", "est_payout_usd", "decision_tag"]].to_string())
     upsert_gold(engine_gold, df_out)
     print("[Gold] Pipeline complete.")
     return df_out
