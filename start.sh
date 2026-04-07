@@ -14,6 +14,33 @@ else
     echo "[OK] Docker already installed."
 fi
 
+# ── 1c. Install NVIDIA Container Toolkit (GPU pass-through for Docker) ────────
+if command -v nvidia-smi &>/dev/null; then
+    if ! dpkg -l | grep -q nvidia-container-toolkit 2>/dev/null; then
+        echo "[INFO] Installing NVIDIA Container Toolkit..."
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+            | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+            | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+            | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        sudo apt-get update -qq
+        sudo apt-get install -y nvidia-container-toolkit
+        sudo nvidia-ctk runtime configure --runtime=docker
+        sudo systemctl restart docker
+        echo "[OK] NVIDIA Container Toolkit installed & Docker restarted."
+    else
+        echo "[OK] NVIDIA Container Toolkit already installed."
+        # Ensure nvidia runtime is configured in Docker
+        if ! docker info 2>/dev/null | grep -q "nvidia"; then
+            echo "[INFO] Configuring NVIDIA runtime for Docker..."
+            sudo nvidia-ctk runtime configure --runtime=docker
+            sudo systemctl restart docker
+        fi
+    fi
+else
+    echo "[WARN] nvidia-smi not found — GPU will NOT be used. Ollama will run on CPU."
+fi
+
 # ── 1b. Install Docker Compose plugin ─────────────────────────────────────────
 if ! docker compose version &>/dev/null; then
     echo "[INFO] Installing Docker Compose plugin..."
@@ -104,4 +131,17 @@ echo "  Streamlit : http://$IP:8501"
 echo "  Ollama    : http://$IP:11434"
 echo "  Oracle DB : $IP:1521 (FREEPDB1)"
 echo "========================================"
+
+# Show GPU status
+if command -v nvidia-smi &>/dev/null; then
+    echo ""
+    echo "[GPU STATUS]"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    echo ""
+    echo "[GPU in Ollama container]"
+    docker exec claims_ollama nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader 2>/dev/null \
+        || echo "  (container not ready yet, check again in 30s)"
+fi
+
+echo ""
 docker compose ps
