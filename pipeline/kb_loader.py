@@ -1,23 +1,12 @@
 """
-KB Loader — Read knowledge base files from OCI Object Storage.
+KB Loader — Read knowledge base files from local folder.
 Config dibaca dari environment variables (.env).
 """
 import os
-import oci
+from pathlib import Path
 from typing import Tuple
 
-
 KB_TEXT_EXTS = (".txt", ".json", ".md", ".csv", ".yaml", ".yml", ".pdf")
-
-
-def _get_cfg():
-    return {
-        "region":      os.getenv("KB_OCI_REGION",    "ap-singapore-1"),
-        "namespace":   os.getenv("KB_OCI_NAMESPACE",  "oscjapac002"),
-        "bucket":      os.getenv("KB_OCI_BUCKET",     "ClaimInsurance"),
-        "prefix":      os.getenv("KB_OCI_PREFIX",     "Private_Car_Policy_Wording"),
-        "pdf_par_url": os.getenv("KB_PDF_PAR_URL",    ""),
-    }
 
 
 def _extract_pdf_pages(pdf_bytes: bytes, max_pages: int = 15) -> list:
@@ -41,55 +30,47 @@ def _extract_pdf_text(pdf_bytes: bytes, max_pages: int = 15) -> str:
 
 
 def load_kb_content(
-    signer,
     max_size_bytes: int = 60_000,
 ) -> Tuple[str, str]:
     """
-    Load KB content from OCI bucket (config from env).
+    Load KB content from local folder (config from env).
     Returns (kb_text, pdf_par_url) tuple.
     """
-    cfg = _get_cfg()
-    client = oci.object_storage.ObjectStorageClient(
-        config={"region": cfg["region"]},
-        signer=signer,
-    )
+    kb_local_path = os.getenv("KB_LOCAL_PATH", "")
+    pdf_url       = os.getenv("KB_PDF_PAR_URL", "")
 
-    try:
-        response = client.list_objects(
-            namespace_name=cfg["namespace"],
-            bucket_name=cfg["bucket"],
-            prefix=cfg["prefix"],
-        )
-    except Exception as e:
-        return f"[Knowledge base unavailable: {str(e)}]", ""
+    if not kb_local_path:
+        return "[Knowledge base unavailable: KB_LOCAL_PATH not set]", pdf_url
 
-    kb_parts = []
-    pdf_url  = cfg["pdf_par_url"]  # static PAR URL from env
+    kb_dir = Path(kb_local_path)
+    if not kb_dir.exists():
+        return f"[Knowledge base unavailable: folder '{kb_local_path}' not found]", pdf_url
+
+    kb_parts    = []
     total_bytes = 0
 
-    for obj in response.data.objects:
-        name = obj.name.lower()
-        if not any(name.endswith(ext) for ext in KB_TEXT_EXTS):
+    for file_path in sorted(kb_dir.iterdir()):
+        if not file_path.is_file():
+            continue
+        if not any(file_path.name.lower().endswith(ext) for ext in KB_TEXT_EXTS):
             continue
         try:
-            resp = client.get_object(
-                namespace_name=cfg["namespace"],
-                bucket_name=cfg["bucket"],
-                object_name=obj.name,
+            raw = file_path.read_bytes()
+            content = (
+                _extract_pdf_text(raw)
+                if file_path.name.lower().endswith(".pdf")
+                else raw.decode("utf-8", errors="ignore")
             )
-            raw = resp.data.content
-            content = _extract_pdf_text(raw) if name.endswith(".pdf") else raw.decode("utf-8", errors="ignore")
-
-            section = f"=== {obj.name} ===\n{content}"
+            section = f"=== {file_path.name} ===\n{content}"
             kb_parts.append(section)
             total_bytes += len(section)
             if total_bytes >= max_size_bytes:
                 kb_parts.append("[...KB truncated due to size limit...]")
                 break
         except Exception as e:
-            kb_parts.append(f"=== {obj.name} === [read error: {str(e)}]")
+            kb_parts.append(f"=== {file_path.name} === [read error: {str(e)}]")
 
     if not kb_parts:
-        return "[Knowledge base is empty or contains no readable files]", ""
+        return "[Knowledge base is empty or contains no readable files]", pdf_url
 
     return "\n\n".join(kb_parts), pdf_url

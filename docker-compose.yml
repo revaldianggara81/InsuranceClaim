@@ -1,10 +1,5 @@
 version: "3.8"
 
-# ============================================================
-# InsuranceClaim — Docker Compose
-# Services: oracle-db | ollama | streamlit
-# ============================================================
-
 networks:
   claims-net:
     driver: bridge
@@ -17,6 +12,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: claims_db-medallion
+    restart: unless-stopped
     ports:
       - "1521:1521"
       - "5500:5500"
@@ -35,13 +31,12 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: claims_ollama
+    restart: unless-stopped
     ports:
       - "11434:11434"
     volumes:
-      # Mount model dari host langsung — tidak perlu download ulang
       - /usr/share/ollama/.ollama:/root/.ollama
       - ./scripts:/scripts
-    # GPU support — hapus blok 'deploy' jika tidak ada GPU
     deploy:
       resources:
         reservations:
@@ -51,7 +46,6 @@ services:
               capabilities: [gpu]
     networks:
       - claims-net
-    # Jalankan Ollama server + pull model secara otomatis
     entrypoint: >
       /bin/sh -c "
         ollama serve &
@@ -66,14 +60,16 @@ services:
       context: .
       dockerfile: Dockerfile.streamlit
     container_name: claims_streamlit
+    restart: unless-stopped
     ports:
       - "8501:8501"
     env_file:
       - .env
     environment:
-      # Override host agar pakai nama service Docker
       ORACLE_BRONZE_HOST: oracle-db
       OLLAMA_BASE_URL: http://ollama:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       oracle-db:
         condition: service_healthy

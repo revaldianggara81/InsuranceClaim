@@ -409,10 +409,8 @@ def run(claim_id_filter=None):
 
     kb_content, pdf_url = "", ""
     try:
-        import oci as _oci
         from pipeline.kb_loader import load_kb_content
-        signer = _oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-        kb_content, pdf_url = load_kb_content(signer)
+        kb_content, pdf_url = load_kb_content()
         print(f"[KB] Loaded {len(kb_content)} chars")
     except Exception as e:
         print(f"[KB] Skipped: {e}")

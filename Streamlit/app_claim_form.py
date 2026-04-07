@@ -3,8 +3,12 @@ import sys
 import datetime as dt
 from typing import Optional
 
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 import streamlit as st
-import oci
+from PIL import Image
 
 # ── Path setup so pipeline/ is importable ─────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -13,27 +17,18 @@ from pipeline.email_notifier     import send_claim_notification
 from pipeline.dashboard_queries  import load_all_decisions, load_claim_details, apply_manual_decision
 
 # ── Page Config ───────────────────────────────────────────────────────────────
+_favicon = Image.open(os.path.join(os.path.dirname(__file__), "oracle_favicon.png"))
 st.set_page_config(
     page_title="Claim Insurance",
+    page_icon=_favicon,
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── OCI Object Storage Config (dari .env) ────────────────────────────────────
-OCI_REGION      = os.getenv("OCI_REGION",         "ap-singapore-1")
-BUCKET_NAME     = os.getenv("OCI_BUCKET_NAME",    "ClaimInsurance")
-EVIDENCE_PREFIX = os.getenv("OCI_EVIDENCE_PREFIX", "Evidance")
-
-try:
-    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-    object_storage = oci.object_storage.ObjectStorageClient(
-        config={"region": OCI_REGION},
-        signer=signer,
-    )
-    namespace = object_storage.get_namespace().data
-except Exception as e:
-    st.error(f"OCI Auth Error: {str(e)}")
-    st.stop()
+# ── RED Object Storage Config (from .env) ────────────────────────────────────
+RED_STORAGE_BASE_URL = os.getenv("RED_STORAGE_BASE_URL", "").rstrip("/")
+RED_AUTH             = (os.getenv("RED_USERNAME", ""), os.getenv("RED_PASSWORD", ""))
+EVIDENCE_PREFIX      = os.getenv("OCI_EVIDENCE_PREFIX", "Evidance")
 
 # ── Claim ID Generation (format: CLM-NNN, global auto-increment) ──────────────
 
@@ -90,21 +85,28 @@ def save_upload(file, claim_id: str, prefix: str) -> bool:
         return False
     filename = file.name.strip()
     if prefix == "video-claimant":
-        object_name = f"{EVIDENCE_PREFIX}/{claim_id}/claimant_video_evidence/{filename}"
+        object_name = f"{EVIDENCE_PREFIX}_{claim_id}_claimant_video_evidence_{filename}"
     elif prefix == "img-claimant":
-        object_name = f"{EVIDENCE_PREFIX}/{claim_id}/claimant_img_evidence/{filename}"
+        object_name = f"{EVIDENCE_PREFIX}_{claim_id}_claimant_img_evidence_{filename}"
     elif prefix == "img-counterparty":
-        object_name = f"{EVIDENCE_PREFIX}/{claim_id}/counterparty_img_evidence/{filename}"
+        object_name = f"{EVIDENCE_PREFIX}_{claim_id}_counterparty_img_evidence_{filename}"
     else:
         return False
-    object_storage.put_object(
-        namespace_name=namespace,
-        bucket_name=BUCKET_NAME,
-        object_name=object_name,
-        put_object_body=file.getvalue(),
-        content_type=file.type,
-    )
-    return True
+    url = f"{RED_STORAGE_BASE_URL}/o/{object_name}"
+    try:
+        resp = requests.put(
+            url,
+            data=file.getvalue(),
+            headers={"Content-Type": file.type},
+            auth=RED_AUTH,
+            verify=False,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        st.warning(f"Evidence upload to RED failed ({filename}): {e}", icon="⚠️")
+        return False
 
 
 # ── Styling ───────────────────────────────────────────────────────────────────
@@ -127,7 +129,7 @@ input[type="text"], [data-baseweb="select"] > div, textarea, [data-testid="stFil
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<p style="font-family:\'Playfair Display\',serif;font-size:20px;font-weight:700;color:#ffffff;margin:0;">Claim Insurance</p>', unsafe_allow_html=True)
-    st.markdown('<p style="font-family:\'Inter\',sans-serif;font-size:8.5px;font-weight:600;color:rgba(255,255,255,0.30);text-transform:uppercase;">Powered by Oracle AIDP</p>', unsafe_allow_html=True)
+    st.markdown('<p style="font-family:\'Inter\',sans-serif;font-size:8.5px;font-weight:600;color:rgba(255,255,255,0.30);text-transform:uppercase;">Powered by Oracle Roving Edge Device</p>', unsafe_allow_html=True)
     st.markdown("<hr style='border-color:rgba(255,255,255,0.12);margin:16px 0;'>", unsafe_allow_html=True)
 
     if st.button("📝  New Claim", use_container_width=True):
@@ -151,6 +153,19 @@ with st.sidebar:
         f'<p style="font-size:10px;color:rgba(255,255,255,0.35);margin-top:8px;">Active: {active_label}</p>',
         unsafe_allow_html=True,
     )
+
+    # ── Policy Document Download ───────────────────────────────
+    _pdf_path = os.path.join(os.path.dirname(__file__), "..", "knowledge_base", "Private_Car_Policy_Wording_M_PCP.pdf")
+    if os.path.exists(_pdf_path):
+        st.markdown("<hr style='border-color:rgba(255,255,255,0.12);margin:16px 0;'>", unsafe_allow_html=True)
+        with open(_pdf_path, "rb") as _f:
+            st.download_button(
+                label="📄  Policy Wording (PDF)",
+                data=_f,
+                file_name="Private_Car_Policy_Wording_M_PCP.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
 
 # ── Decision Color Helpers ────────────────────────────────────────────────────
@@ -281,10 +296,6 @@ _DEC_COLOR = {
     "REJECT":             "#c62828",
     "MANUAL_REVIEW":      "#e65100",
 }
-_TABLE_COLS = [0.8, 1.8, 0.8, 1.2, 0.8, 1.5, 1.5, 2.5]
-_TABLE_HEADERS = ["Claim ID", "Decision", "Action", "Payout", "Conf.", "Tag", "Processed At", "Actions"]
-
-
 def render_dashboard():
     st.markdown(
         "<h1 style='font-family:Playfair Display;color:#17304d;'>"
@@ -308,61 +319,65 @@ def render_dashboard():
 
     display_df = df if selected == "All" else df[df["decision"] == selected]
 
-    # ── Table header ──────────────────────────────────────────────────────────
-    hcols = st.columns(_TABLE_COLS)
-    for hcol, label in zip(hcols, _TABLE_HEADERS):
-        hcol.markdown(
-            f"<span style='font-size:11px;font-weight:700;color:#6c757d;"
-            f"text-transform:uppercase;'>{label}</span>",
+    # ── Data Table ────────────────────────────────────────────────────────────
+    table_df = display_df[["claim_id", "decision", "action", "payout_myr", "confidence", "decision_tag", "created_at"]].copy()
+    table_df = table_df.rename(columns={
+        "claim_id":     "Claim ID",
+        "decision":     "Decision",
+        "action":       "Action",
+        "payout_myr":   "Payout (MYR)",
+        "confidence":   "Confidence",
+        "decision_tag": "Tag",
+        "created_at":   "Processed At",
+    })
+
+    st.dataframe(
+        table_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Claim ID":     st.column_config.TextColumn(width="small"),
+            "Decision":     st.column_config.TextColumn(width="medium"),
+            "Action":       st.column_config.TextColumn(width="small"),
+            "Payout (MYR)": st.column_config.NumberColumn(width="small", format="%.2f"),
+            "Confidence":   st.column_config.NumberColumn(width="small", format="%.2f"),
+            "Tag":          st.column_config.TextColumn(width="medium"),
+            "Processed At": st.column_config.TextColumn(width="medium"),
+        },
+    )
+
+    # ── Manual Review Actions ─────────────────────────────────────────────────
+    manual_df = display_df[display_df["decision"] == "MANUAL_REVIEW"]
+    pending   = manual_df[~manual_df["decision_tag"].isin(["APPROVE_MANUAL", "REJECT_MANUAL"])]
+
+    if not manual_df.empty:
+        st.markdown(
+            "<p style='font-size:11px;font-weight:700;color:#b87716;"
+            "text-transform:uppercase;margin-top:24px;'>Manual Review Actions</p>"
+            "<hr style='margin:0 0 12px;border-color:#dee2e6;'>",
             unsafe_allow_html=True,
         )
-    st.markdown("<hr style='margin:4px 0 8px;border-color:#dee2e6;'>", unsafe_allow_html=True)
-
-    # ── Table rows ────────────────────────────────────────────────────────────
-    for _, row in display_df.iterrows():
-        cid      = str(row["claim_id"])
-        decision = str(row["decision"])
-        tag      = str(row.get("decision_tag") or "—")
-        icon     = _DEC_ICON.get(decision, "⚪")
-        color    = _DEC_COLOR.get(decision, "#495057")
-
-        cols = st.columns(_TABLE_COLS)
-        cols[0].write(cid)
-        cols[1].markdown(
-            f"<span style='color:{color};font-weight:600;font-size:13px;'>{icon} {decision}</span>",
-            unsafe_allow_html=True,
-        )
-        cols[2].write(row["action"])
-        cols[3].write(row["payout_myr"])
-        cols[4].write(row["confidence"])
-        cols[5].write(tag)
-        cols[6].write(row["created_at"])
-
-        # Actions column — only for MANUAL_REVIEW not yet reviewed
-        if decision == "MANUAL_REVIEW":
+        for _, row in manual_df.iterrows():
+            cid = str(row["claim_id"])
+            tag = str(row.get("decision_tag") or "")
+            ac1, ac2, ac3, ac4 = st.columns([1, 1, 1, 4])
+            ac1.markdown(f"**{cid}**")
             if tag in ("APPROVE_MANUAL", "REJECT_MANUAL"):
-                cols[7].markdown(
+                ac2.markdown(
                     f"<span style='font-size:12px;color:#6c757d;'>✔ {tag}</span>",
                     unsafe_allow_html=True,
                 )
             else:
-                with cols[7]:
-                    bc1, bc2, bc3 = st.columns(3)
-                    if bc1.button("🔍", key=f"rev_{cid}", help="Open full review",
-                                  use_container_width=True):
-                        st.session_state.review_claim_id = cid
-                        st.session_state.page = "review"
+                if ac2.button("🔍 Review", key=f"rev_{cid}", use_container_width=True):
+                    st.session_state.review_claim_id = cid
+                    st.session_state.page = "review"
+                    st.rerun()
+                if ac3.button("✅ Approve", key=f"app_{cid}", use_container_width=True, type="primary"):
+                    if apply_manual_decision(cid, "APPROVE"):
                         st.rerun()
-                    if bc2.button("✅", key=f"app_{cid}", help="Approve claim",
-                                  use_container_width=True, type="primary"):
-                        if apply_manual_decision(cid, "APPROVE"):
-                            st.rerun()
-                    if bc3.button("❌", key=f"rej_{cid}", help="Reject claim",
-                                  use_container_width=True):
-                        if apply_manual_decision(cid, "REJECT"):
-                            st.rerun()
-
-        st.markdown("<hr style='margin:4px 0;border-color:#f0f0f0;'>", unsafe_allow_html=True)
+                if ac4.button("❌ Reject", key=f"rej_{cid}", use_container_width=True):
+                    if apply_manual_decision(cid, "REJECT"):
+                        st.rerun()
 
 
 # ── Manual Review Page ────────────────────────────────────────────────────────
@@ -509,7 +524,7 @@ elif not st.session_state.submitted:
     c1, c2 = st.columns([1, 2])
     existing_ids   = load_existing_policy_ids()
     new_id         = generate_next_policy_id(existing_ids)
-    # New ID selalu pertama dan selalu terpilih — user tinggal isi nama & narasi
+    # New ID always first and pre-selected
     policy_options = [new_id] + existing_ids
     policy_id = c1.selectbox("Policy ID", options=policy_options, index=0)
     full_name = c2.text_input("Full Name", value="")
@@ -548,7 +563,7 @@ elif not st.session_state.submitted:
         claim_id = policy_id  # use policy_id as claim_id (matches existing logic)
         st.session_state.claim_id = claim_id
 
-        # Baca bytes sebelum upload agar bisa dipakai VLM
+        # Read bytes before upload so VLM can also use them
         video_bytes    = v_file.read()  if v_file else None
         video_filename = v_file.name    if v_file else None
         img1_bytes     = img1.read()    if img1   else None
@@ -556,7 +571,7 @@ elif not st.session_state.submitted:
         img2_bytes     = img2.read()    if img2   else None
         img2_filename  = img2.name      if img2   else None
 
-        with st.spinner("Uploading evidence to OCI Object Storage..."):
+        with st.spinner("Uploading evidence to RED Object Storage..."):
             if v_file:
                 v_file.seek(0)
                 save_upload(v_file, claim_id, "video-claimant")
